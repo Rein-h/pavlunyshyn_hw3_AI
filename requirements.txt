@@ -1,0 +1,15 @@
+# Colab: torch is preinstalled, the rest installs in a few seconds.
+# Local run with an NVIDIA GPU: install the CUDA build of torch FIRST, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# otherwise pip installs the CPU-only build.
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+tqdm
+torch
+transformers>=4.40
+sentencepiece
+protobuf
+ipykernel
