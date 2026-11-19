@@ -585,18 +585,42 @@ def run_report(run: dict, va: pd.DataFrame, title: str = ""):
     return per_class_table(m), by.to_frame(), plot_confusion(va["label"], pred, title)
 
 
-def compare_runs(paths: Paths, names: list[str], va: pd.DataFrame) -> pd.DataFrame:
-    """Same val split for every run: macro-F1, per-class F1, macro-F1 per language."""
+def run_exists(paths: Paths, name: str) -> bool:
+    d = paths.runs / name
+    return all((d / f).exists() for f in ("metrics.json", "val_proba.npy", "test_proba.npy",
+                                          "val_ids.csv", "test_ids.csv"))
+
+
+def compare_runs(paths: Paths, names, va: pd.DataFrame, baseline: str | None = "baseline_tfidf",
+                 reference: str | None = "encoder_xlmr_chunks") -> pd.DataFrame:
+    """Same val split for every run: macro-F1, per-class F1, macro-F1 per language.
+
+    `names` is a list of run names or a dict {run name: description}. Runs that do not
+    exist yet are skipped. Adds the difference to the baseline and to the reference.
+    """
+    descr = names if isinstance(names, dict) else {n: "" for n in names}
     rows = {}
-    for name in names:
+    for name, d in descr.items():
+        if not run_exists(paths, name):
+            continue
         run = load_run(paths.runs / name)
         proba = pd.DataFrame(run["val_proba"], index=run["val_ids"])
         pred = np.array(LABELS)[proba.reindex(va["id"]).to_numpy().argmax(1)]
         m = evaluate(va["label"], pred)
-        row = {"macro_f1": m["macro_f1"], **{f"F1 {l}": m[f"{l}_f1"] for l in LABELS}}
+        row = {"description": d, "macro_f1": m["macro_f1"], **{f"F1 {l}": m[f"{l}_f1"] for l in LABELS}}
         row.update({f"macro_f1 {k}": v for k, v in f1_by(va, pred, "lang").items()})
         rows[name] = row
-    return pd.DataFrame(rows).T.round(4)
+    out = pd.DataFrame(rows).T
+    if out.empty:
+        return out
+    for ref, col in ((baseline, "Δ vs baseline"), (reference, "Δ vs XLM-R")):
+        if ref is not None and ref in out.index:
+            out[col] = out["macro_f1"].astype(float) - float(out.loc[ref, "macro_f1"])
+    if not isinstance(names, dict):
+        out = out.drop(columns="description")
+    num = out.columns.drop("description", errors="ignore")
+    out[num] = out[num].astype(float).round(4)
+    return out
 
 
 # =============================================================================
@@ -938,29 +962,37 @@ def _autocast(device: str, cfg: EncoderConfig):
     return contextlib.nullcontext()
 
 
-def predict_docs(model, tokenizer, docs, cfg: EncoderConfig, device: str,
-                 desc: str = "predict") -> np.ndarray:
-    """Average window probabilities per text -> (n_docs, 3) in LABELS order."""
+def predict_windows(model, tokenizer, docs, cfg: EncoderConfig, device: str, k: int | None,
+                    desc: str = "predict"):
+    """Probabilities of every window -> (doc index, window start, probs (n_windows, 3))."""
     import torch
     from torch.utils.data import DataLoader
     from tqdm.auto import tqdm
 
-    items = build_windows(docs, cfg, cfg.max_eval_windows)
+    items = build_windows(docs, cfg, k)
     items.sort(key=lambda it: min(len(docs[it[0]]) - it[1], cfg.max_len))  # less padding
     ds = WindowDataset(docs, items, None, cfg, tokenizer)
     dl = DataLoader(ds, batch_size=cfg.eval_batch_size, shuffle=False,
                     num_workers=cfg.num_workers, collate_fn=Collate(tokenizer.pad_token_id))
-    sums = np.zeros((len(docs), len(LABELS)), dtype=np.float64)
-    counts = np.zeros(len(docs), dtype=np.int64)
+    probs = []
     model.eval()
     with torch.no_grad():
-        for ids, mask, _, doc in tqdm(dl, desc=desc, leave=False):
+        for ids, mask, _, _ in tqdm(dl, desc=desc, leave=False):
             with _autocast(device, cfg):
                 logits = model(input_ids=ids.to(device), attention_mask=mask.to(device)).logits
-            p = torch.softmax(logits.float(), -1).cpu().numpy()
-            np.add.at(sums, doc.numpy(), p)
-            np.add.at(counts, doc.numpy(), 1)
-    return (sums / counts[:, None]).astype(np.float32)
+            probs.append(torch.softmax(logits.float(), -1).cpu().numpy())
+    doc = np.array([it[0] for it in items], dtype=np.int64)
+    start = np.array([it[1] for it in items], dtype=np.int64)
+    return doc, start, np.concatenate(probs).astype(np.float32)
+
+
+def predict_docs(model, tokenizer, docs, cfg: EncoderConfig, device: str,
+                 desc: str = "predict") -> np.ndarray:
+    """Average window probabilities per text -> (n_docs, 3) in LABELS order."""
+    doc, _, p = predict_windows(model, tokenizer, docs, cfg, device, cfg.max_eval_windows, desc)
+    sums = np.zeros((len(docs), len(LABELS)))
+    np.add.at(sums, doc, p)
+    return (sums / np.bincount(doc, minlength=len(docs))[:, None]).astype(np.float32)
 
 
 def _load_model_and_tokenizer(cfg: EncoderConfig):
@@ -1082,7 +1114,7 @@ def train_encoder(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
                         generator=torch.Generator().manual_seed(cfg.seed + epoch))  # keeps global RNG untouched
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        last_save = time.time()
+        last_save, bad_steps = time.time(), 0
         bar = tqdm(dl, desc=f"epoch {epoch + 1}/{cfg.epochs}", initial=first, total=n_batches,
                    leave=False)
         for step, (ids, mask, labels, _) in enumerate(bar, start=first):
@@ -1091,8 +1123,15 @@ def train_encoder(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
                             labels=labels.to(device))
                 loss = out.loss / grad_accum
             scaler.scale(loss).backward()
-            running += out.loss.item() * len(labels)
-            n_seen += len(labels)
+            loss_value = out.loss.item()
+            if not np.isfinite(loss_value):  # fp16 overflow: GradScaler skips this step
+                bad_steps += 1
+                if bad_steps >= 50:
+                    raise RuntimeError("50 non-finite losses in a row - rerun with fp16=False")
+            else:
+                bad_steps = 0
+                running += loss_value * len(labels)
+                n_seen += len(labels)
             if (step + 1) % grad_accum == 0 or step + 1 == n_batches:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1133,3 +1172,427 @@ def train_encoder(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
     last_ckpt.unlink(missing_ok=True)  # not needed once training is finished
     return {"config": asdict(cfg), "metrics": metrics, "val_proba": va_proba,
             "test_proba": te_proba, "history": pd.DataFrame(history)}
+
+
+# =============================================================================
+# 7. Experiments
+# =============================================================================
+def save_experiment(paths: Paths, name: str, va: pd.DataFrame, te: pd.DataFrame,
+                    val_proba: np.ndarray, test_proba: np.ndarray, sample: pd.DataFrame,
+                    config: dict) -> dict:
+    """Evaluate on val, write submission and everything else to runs/<name>/."""
+    m = evaluate(va["label"], np.array(LABELS)[np.asarray(val_proba).argmax(1)])
+    sub = make_submission(te["id"], np.array(LABELS)[np.asarray(test_proba).argmax(1)], sample)
+    save_run(paths.runs / name, m, config, va["id"], val_proba, te["id"], test_proba, sub)
+    print(f"{name}: val macro-F1 = {m['macro_f1']:.4f}")
+    return m
+
+
+def grouped_folds(va: pd.DataFrame, n_splits: int = 5, seed: int = SEED) -> list:
+    """Folds of the validation set that keep groups whole (for models trained on val)."""
+    from sklearn.model_selection import StratifiedGroupKFold
+
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return list(sgkf.split(va, va["label"], va["group"]))
+
+
+def make_hgb(seed: int = SEED):
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    return HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
+                                          l2_regularization=1.0, early_stopping=False,
+                                          random_state=seed)
+
+
+def model_proba(model, X) -> np.ndarray:
+    order = [list(model.classes_).index(l) for l in LABELS]
+    return model.predict_proba(X)[:, order]
+
+
+def cv_on_val(X_val: pd.DataFrame, y_val, folds, X_test: pd.DataFrame, make_model):
+    """Models that learn from other models' val outputs are trained on val with grouped CV.
+
+    Returns out-of-fold val probabilities (honest estimate) and test probabilities of a
+    model fitted on the whole val set.
+    """
+    y_val = np.asarray(y_val)
+    oof = np.zeros((len(X_val), len(LABELS)), dtype=np.float32)
+    for tr_idx, te_idx in folds:
+        model = make_model().fit(X_val.iloc[tr_idx], y_val[tr_idx])
+        oof[te_idx] = model_proba(model, X_val.iloc[te_idx])
+    final = make_model().fit(X_val, y_val)
+    return oof, model_proba(final, X_test).astype(np.float32), final
+
+
+def add_meta_columns(X: pd.DataFrame, df: pd.DataFrame, langs, domains) -> pd.DataFrame:
+    """One-hot language and domain (fixed category lists, same columns for every split)."""
+    X = X.reset_index(drop=True).copy()
+    for v in langs:
+        X[f"lang={v}"] = (df["lang"].to_numpy() == v).astype(np.float32)
+    for v in domains:
+        X[f"domain={v}"] = (df["domain"].to_numpy() == v).astype(np.float32)
+    return X
+
+
+def plot_permutation_importance(model, X: pd.DataFrame, y, title: str, top: int = 15,
+                                n: int = 3000, seed: int = SEED):
+    """Drop in val macro-F1 when one feature is shuffled (bigger = model relies on it more)."""
+    from sklearn.inspection import permutation_importance
+
+    idx = np.random.default_rng(seed).permutation(len(X))[:n]
+    r = permutation_importance(model, X.iloc[idx], np.asarray(y)[idx], scoring="f1_macro",
+                               n_repeats=3, random_state=seed)
+    imp = pd.Series(r.importances_mean, index=X.columns).sort_values().tail(top)
+    fig, ax = plt.subplots(figsize=(7, 0.32 * len(imp) + 1))
+    imp.plot.barh(ax=ax, color="steelblue")
+    ax.set_xlabel("drop of macro-F1 when shuffled")
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig, imp.sort_values(ascending=False)
+
+
+# ---- Experiments 1-2: window-level predictions of a trained encoder ---------
+def load_encoder_config(run_dir: Path) -> EncoderConfig:
+    from dataclasses import fields
+
+    conf = json.loads((run_dir / "config.json").read_text())
+    names = {f.name for f in fields(EncoderConfig)}
+    return EncoderConfig(**{k: v for k, v in conf.items() if k in names})
+
+
+def load_trained_encoder(run_dir: Path):
+    """Model + tokenizer with the best epoch's weights of a finished encoder run."""
+    import torch
+
+    cfg = load_encoder_config(run_dir)
+    device = get_device()
+    cfg.batch_size = cfg.eval_batch_size = None
+    cfg = _auto_batch(cfg, device)
+    model, tokenizer = _load_model_and_tokenizer(cfg)
+    state = torch.load(run_dir / "best_model.pt", map_location="cpu")
+    model.load_state_dict({k: v.float() if v.is_floating_point() else v for k, v in state.items()})
+    return model.to(device), tokenizer, cfg, device
+
+
+def encoder_window_predictions(run_dir: Path, df: pd.DataFrame, split: str,
+                               recompute: bool = False) -> dict:
+    """Probabilities of ALL windows of every text; cached in run_dir/windows_<split>.npz.
+
+    pos = index of the window inside its text (0 = beginning), n = windows of that text.
+    """
+    f = run_dir / f"windows_{split}.npz"
+    ids = df["id"].astype(str).to_numpy()
+    if f.exists() and not recompute:
+        z = np.load(f, allow_pickle=False)
+        if len(z["ids"]) == len(ids) and (z["ids"] == ids).all():
+            return {k: z[k] for k in ("doc", "pos", "n", "probs")}
+    model, tokenizer, cfg, device = load_trained_encoder(run_dir)
+    if device == "cpu":
+        print("WARNING: no GPU - window predictions on CPU are very slow.")
+    docs = tokenize_texts(df["text"], tokenizer)
+    doc, start, probs = predict_windows(model, tokenizer, docs, cfg, device, k=None, desc=split)
+    order = np.lexsort((start, doc))
+    doc, start, probs = doc[order], start[order], probs[order]
+    first = np.searchsorted(doc, doc)                       # index of the doc's first window
+    pos = np.arange(len(doc)) - first
+    n = np.bincount(doc, minlength=len(df))[doc]
+    np.savez(f, ids=ids, doc=doc, pos=pos, n=n, probs=probs)
+    del model
+    return {"doc": doc, "pos": pos, "n": n, "probs": probs}
+
+
+def aggregate_windows(win: dict, n_docs: int, how: str) -> np.ndarray:
+    """first = beginning of the text only; first_last = beginning + end; mean = all windows."""
+    doc, pos, n, p = win["doc"], win["pos"], win["n"], win["probs"]
+    if how == "first":
+        keep = pos == 0
+    elif how == "first_last":
+        keep = (pos == 0) | (pos == n - 1)
+    elif how == "mean":
+        keep = np.ones(len(doc), dtype=bool)
+    else:
+        raise ValueError(how)
+    sums = np.zeros((n_docs, len(LABELS)))
+    np.add.at(sums, doc[keep], p[keep])
+    return (sums / np.bincount(doc[keep], minlength=n_docs)[:, None]).astype(np.float32)
+
+
+def window_disagreement_features(win: dict, n_docs: int) -> pd.DataFrame:
+    """Per text: mean / max / min / std of each class probability over its windows,
+    first and last window, max - min (how much the windows disagree), number of windows."""
+    doc, pos, n, p = win["doc"], win["pos"], win["n"], win["probs"]
+    cols = {}
+    frame = pd.DataFrame(p, columns=LABELS)
+    frame["doc"] = doc
+    g = frame.groupby("doc")[LABELS]
+    for stat in ("mean", "max", "min", "std"):
+        agg = getattr(g, stat)().reindex(range(n_docs))
+        for l in LABELS:
+            cols[f"{l}_{stat}"] = agg[l].to_numpy()
+    for l in LABELS:
+        cols[f"{l}_range"] = cols[f"{l}_max"] - cols[f"{l}_min"]
+        cols[f"{l}_std"] = np.nan_to_num(cols[f"{l}_std"])  # single window -> 0
+    for name, mask in (("first", pos == 0), ("last", pos == n - 1)):
+        sub = pd.DataFrame(p[mask], columns=LABELS, index=doc[mask]).reindex(range(n_docs))
+        for l in LABELS:
+            cols[f"{l}_{name}"] = sub[l].to_numpy()
+    cols["n_windows"] = np.bincount(doc, minlength=n_docs).astype(float)
+    return pd.DataFrame(cols)
+
+
+# ---- Experiment 3: stylometry -------------------------------------------------
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+_PUNCT = {",": "comma", ".": "period", ";": "semicolon", ":": "colon", "!": "excl", "?": "quest",
+          "(": "paren", '"': "dquote", "'": "squote", "-": "hyphen", "–": "endash", "—": "emdash",
+          "…": "ellipsis"}
+_FIRST_PERSON = {"i", "me", "my", "mine", "we", "us", "our", "ours",
+                 "ich", "mich", "mir", "mein", "meine", "meiner", "wir", "uns", "unser", "unsere"}
+
+
+def _style_basic(text: str) -> dict:
+    sents = [s for s in _SENT_SPLIT.split(text.strip()) if s.strip()]
+    sent_len = np.array([len(_WORD_RE.findall(s)) for s in sents] or [0], dtype=float)
+    words = _WORD_RE.findall(text)
+    wlen = np.array([len(w) for w in words] or [0], dtype=float)
+    first = [w.lower() for w in words[:150]]
+    return {"sent_len_mean": sent_len.mean(), "word_len_mean": wlen.mean(),
+            "comma_per_sent": text.count(",") / max(1, len(sents)),
+            "ttr150": len(set(first)) / max(1, len(first))}
+
+
+def stylometry_features(text: str) -> dict:
+    """Numbers that describe HOW a text is written, not what it is about."""
+    n_chars = max(1, len(text))
+    sents = [s for s in _SENT_SPLIT.split(text.strip()) if s.strip()]
+    sent_len = np.array([len(_WORD_RE.findall(s)) for s in sents] or [0], dtype=float)
+    words = _WORD_RE.findall(text)
+    n_words = max(1, len(words))
+    wlen = np.array([len(w) for w in words] or [0], dtype=float)
+    low = [w.lower() for w in words]
+    first300 = low[:300]
+    counts = pd.Series(first300).value_counts() if first300 else pd.Series(dtype=int)
+    letters = sum(c.isalpha() for c in text)
+    f = {
+        "n_words": len(words), "n_sents": len(sents), "log_chars": np.log1p(len(text)),
+        "sent_len_mean": sent_len.mean(), "sent_len_std": sent_len.std(),
+        "sent_len_cv": sent_len.std() / max(1e-6, sent_len.mean()),
+        "sent_len_max": sent_len.max(), "short_sent_share": (sent_len < 8).mean(),
+        "long_sent_share": (sent_len > 30).mean(),
+        "word_len_mean": wlen.mean(), "word_len_std": wlen.std(),
+        "long_word_share": (wlen >= 7).mean(),
+        "ttr300": len(counts) / max(1, len(first300)),
+        "hapax300": (counts == 1).sum() / max(1, len(first300)),
+        "digit_share": sum(c.isdigit() for c in text) / n_chars,
+        "upper_share": sum(c.isupper() for c in text) / max(1, letters),
+        "first_person_per100": 100 * sum(w in _FIRST_PERSON for w in low) / n_words,
+        "newlines_per1k": 1000 * text.count("\n") / n_chars,
+        "paragraphs": text.count("\n\n") + 1,
+        "quest_sent_share": np.mean([s.rstrip().endswith("?") for s in sents]) if sents else 0.0,
+        "excl_sent_share": np.mean([s.rstrip().endswith("!") for s in sents]) if sents else 0.0,
+    }
+    for ch, name in _PUNCT.items():
+        f[f"{name}_per1k"] = 1000 * text.count(ch) / n_chars
+    # style inside the text: first half vs second half, and spread over 5-sentence chunks
+    half = max(1, len(sents) // 2)
+    a, b = _style_basic(" ".join(sents[:half])), _style_basic(" ".join(sents[half:]))
+    for k in a:
+        f[f"halves_diff_{k}"] = abs(a[k] - b[k])
+    chunks = [sent_len[i:i + 5].mean() for i in range(0, len(sent_len), 5)]
+    f["chunk_sent_len_std"] = float(np.std(chunks)) if len(chunks) > 1 else 0.0
+    return f
+
+
+def load_or_make_stylometry(df: pd.DataFrame, cache_file: Path, recompute: bool = False) -> pd.DataFrame:
+    if cache_file.exists() and not recompute:
+        X = pd.read_pickle(cache_file)
+        if len(X) == len(df) and (X.index == df["id"].to_numpy()).all():
+            return X.reset_index(drop=True)
+    from tqdm.auto import tqdm
+
+    X = pd.DataFrame([stylometry_features(t) for t in tqdm(df["text"], desc=cache_file.stem, leave=False)])
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    X.set_axis(df["id"].to_numpy()).to_pickle(cache_file)
+    return X
+
+
+# ---- Experiment 4: perplexity features from an open causal LM ----------------
+@dataclass
+class PerplexityConfig:
+    model_name: str = "Qwen/Qwen2.5-0.5B"   # open weights, multilingual (incl. German)
+    max_tokens: int = 1024                  # tokens read per text
+    segment: int = 64                       # tokens per segment for "inside the text" features
+    batch_size: int = 4
+    shard_size: int = 2000                  # texts per saved shard (resume after a crash)
+    train_n: int | None = 16_000            # train texts used (None = all of the train split)
+
+
+def _load_causal_lm(cfg: PerplexityConfig):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers.utils import logging as hf_logging
+
+    hf_logging.set_verbosity_error()
+    tok = AutoTokenizer.from_pretrained(cfg.model_name)
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_name)
+    return model, tok
+
+
+PPL_FEATURES = ["n_tokens", "lp_mean", "lp_std", "lp_min", "lp_p10", "lp_p25", "lp_p50", "lp_p75",
+                "lp_p90", "ent_mean", "ent_std", "lp_over_ent", "surprise_minus_ent_mean",
+                "surprise_minus_ent_std", "seg_lp_std", "seg_lp_range", "seg_lp_min", "seg_lp_max",
+                "seg_ratio_std", "halves_lp_diff"]
+
+
+def _ppl_doc_features(lp: np.ndarray, ent: np.ndarray, segment: int) -> list[float]:
+    """lp = log-probability of every actual token, ent = entropy of the model's prediction."""
+    if len(lp) < 2:
+        return [len(lp)] + [np.nan] * (len(PPL_FEATURES) - 1)
+    surprise = -lp
+    seg_lp = np.array([lp[i:i + segment].mean() for i in range(0, len(lp), segment)])
+    seg_ratio = np.array([surprise[i:i + segment].mean() / max(1e-6, ent[i:i + segment].mean())
+                          for i in range(0, len(lp), segment)])
+    h = len(lp) // 2
+    return [len(lp), lp.mean(), lp.std(), lp.min(), *np.percentile(lp, [10, 25, 50, 75, 90]),
+            ent.mean(), ent.std(), surprise.mean() / max(1e-6, ent.mean()),
+            (surprise - ent).mean(), (surprise - ent).std(),
+            seg_lp.std(), seg_lp.max() - seg_lp.min(), seg_lp.min(), seg_lp.max(),
+            seg_ratio.std(), abs(lp[:h].mean() - lp[h:].mean())]
+
+
+def _ppl_batch(model, tok, texts, cfg: PerplexityConfig, device: str) -> np.ndarray:
+    import torch
+
+    ids = tok(list(texts), add_special_tokens=False, truncation=True,
+              max_length=cfg.max_tokens)["input_ids"]
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    n = max(2, max(len(x) for x in ids))
+    x = torch.full((len(ids), n), pad, dtype=torch.long)
+    mask = torch.zeros((len(ids), n), dtype=torch.long)
+    for i, seq in enumerate(ids):
+        x[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+        mask[i, :len(seq)] = 1
+    with torch.no_grad():
+        logits = model(input_ids=x.to(device), attention_mask=mask.to(device)).logits
+        rows = []
+        for i, seq in enumerate(ids):
+            L = len(seq)
+            if L < 2:
+                rows.append(_ppl_doc_features(np.zeros(L), np.zeros(L), cfg.segment))
+                continue
+            logp = torch.log_softmax(logits[i, :L - 1].float(), -1)
+            target = x[i, 1:L].to(device)
+            lp = logp.gather(1, target[:, None])[:, 0]
+            ent = -(logp.exp() * logp).sum(-1)
+            rows.append(_ppl_doc_features(lp.cpu().numpy(), ent.cpu().numpy(), cfg.segment))
+            del logp
+    return np.asarray(rows, dtype=np.float32)
+
+
+def load_or_make_perplexity(df: pd.DataFrame, cfg: PerplexityConfig, cache_dir: Path,
+                            split: str) -> pd.DataFrame:
+    """Perplexity features of every text, computed in shards that are saved one by one."""
+    import torch
+    from tqdm.auto import tqdm
+
+    d = cache_dir / split
+    d.mkdir(parents=True, exist_ok=True)
+    meta = {"model": cfg.model_name, "max_tokens": cfg.max_tokens, "segment": cfg.segment,
+            "shard_size": cfg.shard_size, "ids_hash": split_fingerprint(df, df.iloc[:0])}
+    meta_file = d / "meta.json"
+    if meta_file.exists() and json.loads(meta_file.read_text()) != meta:
+        for f in d.glob("shard_*.npy"):
+            f.unlink()  # different texts or settings -> start again
+    meta_file.write_text(json.dumps(meta, indent=2))
+
+    n_shards = int(np.ceil(len(df) / cfg.shard_size))
+    todo = [i for i in range(n_shards) if not (d / f"shard_{i:04d}.npy").exists()]
+    if todo:
+        device = get_device()
+        if device == "cpu":
+            print("WARNING: no GPU - perplexity features on CPU are very slow.")
+        model, tok = _load_causal_lm(cfg)
+        model = model.to(device, dtype=torch.float16 if device == "cuda" else torch.float32).eval()
+        texts = df["text"].tolist()
+        for i in tqdm(todo, desc=f"{split} shards", leave=False):
+            lo, hi = i * cfg.shard_size, min(len(df), (i + 1) * cfg.shard_size)
+            chunk = texts[lo:hi]
+            order = np.argsort([len(t) for t in chunk])  # similar lengths in a batch -> less padding
+            out = np.zeros((len(chunk), len(PPL_FEATURES)), dtype=np.float32)
+            for b in range(0, len(chunk), cfg.batch_size):
+                idx = order[b:b + cfg.batch_size]
+                out[idx] = _ppl_batch(model, tok, [chunk[j] for j in idx], cfg, device)
+            np.save(d / f"shard_{i:04d}.npy", out)
+        del model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    feats = np.concatenate([np.load(d / f"shard_{i:04d}.npy") for i in range(n_shards)])
+    return pd.DataFrame(feats, columns=PPL_FEATURES)
+
+
+# ---- Experiment 6: thresholds (class bias) and stacking -----------------------
+def _log(p: np.ndarray) -> np.ndarray:
+    return np.log(np.clip(np.asarray(p, dtype=np.float64), 1e-6, 1.0))
+
+
+def tune_class_bias(proba: np.ndarray, y, grid=np.linspace(-1.5, 1.5, 31), passes: int = 2) -> np.ndarray:
+    """Additive bias for log-probabilities of ai and fusion (human fixed at 0) that maximises
+    macro-F1. Coordinate search; on ties the smaller bias wins."""
+    from sklearn.metrics import f1_score
+
+    y = np.asarray(y)
+    lp = _log(proba)
+    bias = np.zeros(len(LABELS))
+    score = lambda b: f1_score(y, np.array(LABELS)[(lp + b).argmax(1)], labels=LABELS, average="macro")
+    best = score(bias)
+    for _ in range(passes):
+        for c in (1, 2):
+            for v in sorted(grid, key=abs):
+                b = bias.copy()
+                b[c] = v
+                s = score(b)
+                if s > best + 1e-9:
+                    best, bias = s, b
+    return bias
+
+
+def apply_bias(proba: np.ndarray, bias: np.ndarray) -> np.ndarray:
+    return scores_to_proba(_log(proba) + bias).astype(np.float32)
+
+
+def cv_class_bias(val_proba: np.ndarray, y, folds, test_proba: np.ndarray):
+    """Honest estimate of thresholds: each val fold uses a bias tuned on the other folds.
+    Test uses the bias tuned on the whole val set."""
+    y = np.asarray(y)
+    out = np.zeros_like(val_proba, dtype=np.float32)
+    for tr_idx, te_idx in folds:
+        out[te_idx] = apply_bias(val_proba[te_idx], tune_class_bias(val_proba[tr_idx], y[tr_idx]))
+    bias = tune_class_bias(val_proba, y)
+    return out, apply_bias(test_proba, bias), bias
+
+
+def run_probs(paths: Paths, name: str, va: pd.DataFrame, te: pd.DataFrame):
+    """Saved val / test probabilities of a run, aligned to the rows of va / te."""
+    run = load_run(paths.runs / name)
+    pv = pd.DataFrame(run["val_proba"], index=run["val_ids"]).reindex(va["id"]).to_numpy()
+    pt = pd.DataFrame(run["test_proba"], index=run["test_ids"]).reindex(te["id"]).to_numpy()
+    return pv.astype(np.float32), pt.astype(np.float32)
+
+
+def stacking_inputs(paths: Paths, names: list[str], va: pd.DataFrame, te: pd.DataFrame):
+    """Log-probabilities of every available run as columns (aligned to va / te by id)."""
+    Xv, Xt, used = {}, {}, []
+    for name in names:
+        if not run_exists(paths, name):
+            continue
+        pv, pt = run_probs(paths, name, va, te)
+        for j, l in enumerate(LABELS):
+            Xv[f"{name}:{l}"], Xt[f"{name}:{l}"] = _log(pv[:, j]), _log(pt[:, j])
+        used.append(name)
+    return pd.DataFrame(Xv), pd.DataFrame(Xt), used
+
+
+def make_stacker(seed: int = SEED):
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    return make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=3000, random_state=seed))
