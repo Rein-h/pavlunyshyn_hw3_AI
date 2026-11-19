@@ -68,18 +68,18 @@ DATA_FILES = ("train.csv", "test.csv", "sample_submission.csv")
 
 
 def get_paths(local_root: str | None = None,
-              colab_root: str = "/content/drive/MyDrive/ucu-hw3",
+              colab_root: str = "/content/drive/MyDrive/hw3",
               colab_local_data: str = "/content/data") -> Paths:
     """Resolve project folders.
 
     Colab: the project folder lives on the mounted Google Drive; csv files are
     copied once to the Colab disk because reading from Drive is slow.
-    Local: `local_root` argument, else env var HW3_ROOT, else ./ucu-hw3.
+    Local: `local_root` argument, else env var HW3_ROOT, else ./hw3.
     """
     if in_colab():
         root = Path(colab_root)
     else:
-        root = Path(local_root or os.environ.get("HW3_ROOT", "ucu-hw3"))
+        root = Path(local_root or os.environ.get("HW3_ROOT", "hw3"))
     data = root / "data"
     missing = [f for f in DATA_FILES if not (data / f).exists()]
     if missing:
@@ -826,6 +826,7 @@ class EncoderConfig:
     fp16: bool = True            # mixed precision on CUDA
     freeze_embeddings: bool | None = None  # None -> True on GPUs with < 8 GB
     num_workers: int | None = None  # None -> 2 on Linux/Colab, 0 on Windows/macOS
+    checkpoint_minutes: float = 15  # save last.pt this often inside an epoch (Colab sessions are short)
     seed: int = SEED
     extra: dict = field(default_factory=dict)
 
@@ -982,9 +983,11 @@ def train_encoder(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
     (new windows every epoch), inference averages probabilities over up to
     `max_eval_windows` evenly spaced windows that cover the text.
 
-    Colab-safe: after every epoch `last.pt` (model + optimizer) is written to
-    `run_dir`; if the session dies, calling this again resumes from it.
-    Only the best epoch's weights are kept (`best_model.pt`, fp16).
+    Colab-safe: `last.pt` is written every `checkpoint_minutes` inside an epoch and
+    after every epoch. If the session dies, calling this again continues from the
+    next batch (window choice and batch order of every epoch are fixed by the seed).
+    `last.pt` holds only trainable weights + their optimizer state; it is replaced in
+    place and deleted when training ends. The best epoch's weights: `best_model.pt` (fp16).
     """
     import torch
     from torch.utils.data import DataLoader
@@ -993,11 +996,19 @@ def train_encoder(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
 
     seed_everything(cfg.seed)
     device = get_device()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    last_ckpt = run_dir / "last.pt"
+    state = None
+    if resume and last_ckpt.exists():
+        state = torch.load(last_ckpt, map_location="cpu", weights_only=False)
+        cfg.batch_size = state["batch_size"]  # batch order must match the interrupted run
+        cfg.freeze_embeddings = state["freeze_embeddings"]
     cfg = _auto_batch(cfg, device)
     grad_accum = max(1, cfg.effective_batch // cfg.batch_size)
-    run_dir.mkdir(parents=True, exist_ok=True)
     print(f"device={device}, batch={cfg.batch_size} x accum {grad_accum}, "
           f"freeze_embeddings={cfg.freeze_embeddings}")
+    if device == "cpu":
+        print("WARNING: no GPU - fine-tuning on CPU takes days. Switch the runtime to GPU.")
 
     model, tokenizer = _load_model_and_tokenizer(cfg)
     if cfg.freeze_embeddings:
@@ -1011,72 +1022,104 @@ def train_encoder(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
 
     no_decay = ("bias", "LayerNorm.weight", "layernorm", "layer_norm")
     params = [p for p in model.named_parameters() if p[1].requires_grad]
+    trainable = {n for n, _ in params}
     optimizer = torch.optim.AdamW([
         {"params": [p for n, p in params if not any(k in n for k in no_decay)],
          "weight_decay": cfg.weight_decay},
         {"params": [p for n, p in params if any(k in n for k in no_decay)], "weight_decay": 0.0},
     ], lr=cfg.lr)
-    steps_per_epoch = int(np.ceil(len(tr_docs) * cfg.train_windows / cfg.batch_size / grad_accum))
+    n_windows = sum(min(cfg.train_windows, len(window_starts(len(d), cfg.max_len - 2,
+                                                            cfg.max_len - 2 - cfg.overlap)))
+                    for d in tr_docs)
+    n_batches = int(np.ceil(n_windows / cfg.batch_size))
+    steps_per_epoch = int(np.ceil(n_batches / grad_accum))
     scheduler = get_linear_schedule_with_warmup(
         optimizer, int(cfg.warmup_ratio * steps_per_epoch * cfg.epochs), steps_per_epoch * cfg.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and cfg.fp16))
 
-    start_epoch, best_f1, history = 0, -1.0, []
-    last_ckpt = run_dir / "last.pt"
-    if resume and last_ckpt.exists():
-        state = torch.load(last_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(state["model"])
+    start_epoch, start_batch, best_f1, history = 0, 0, -1.0, []
+    running, n_seen = 0.0, 0
+    if state is not None:
+        model.load_state_dict(state["model"], strict=False)
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         scaler.load_state_dict(state["scaler"])
-        start_epoch, best_f1, history = state["epoch"], state["best_f1"], state["history"]
-        print(f"resumed from epoch {start_epoch} (best val macro-F1 {best_f1:.4f})")
+        start_epoch, start_batch = state["epoch"], state["batch"]
+        best_f1, history = state["best_f1"], state["history"]
+        running, n_seen = state["running"], state["n_seen"]
+        torch.set_rng_state(state["rng_cpu"])  # same dropout masks as an uninterrupted run
+        if device == "cuda" and state["rng_cuda"] is not None:
+            torch.cuda.set_rng_state_all(state["rng_cuda"])
+        print(f"resumed: epoch {start_epoch + 1}, batch {start_batch}/{n_batches} "
+              f"(best val macro-F1 so far {best_f1:.4f})")
+        del state
+
+    def save_last(epoch: int, batch: int) -> None:
+        """Atomic save: a session that dies while writing never leaves a broken last.pt."""
+        tmp = run_dir / "last.pt.tmp"
+        torch.save({"model": {k: v for k, v in model.state_dict().items() if k in trainable},
+                    "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict(), "epoch": epoch, "batch": batch,
+                    "best_f1": best_f1, "history": history, "running": running,
+                    "n_seen": n_seen, "batch_size": cfg.batch_size,
+                    "freeze_embeddings": cfg.freeze_embeddings,
+                    "rng_cpu": torch.get_rng_state(),
+                    "rng_cuda": torch.cuda.get_rng_state_all() if device == "cuda" else None}, tmp)
+        os.replace(tmp, last_ckpt)
 
     collate = Collate(tokenizer.pad_token_id)
     for epoch in range(start_epoch, cfg.epochs):
         t0 = time.time()
-        rng = np.random.default_rng(cfg.seed + epoch)
-        ds = WindowDataset(tr_docs, build_windows(tr_docs, cfg, cfg.train_windows, rng),
-                           tr_y, cfg, tokenizer)
-        dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate,
-                        num_workers=cfg.num_workers,
-                        generator=torch.Generator().manual_seed(cfg.seed + epoch))
+        windows = build_windows(tr_docs, cfg, cfg.train_windows, np.random.default_rng(cfg.seed + epoch))
+        ds = WindowDataset(tr_docs, windows, tr_y, cfg, tokenizer)
+        # fixed batch order for this epoch -> after a resume the epoch continues where it stopped
+        order = np.random.default_rng(cfg.seed + 1000 + epoch).permutation(len(ds))
+        first = start_batch if epoch == start_epoch else 0
+        if first == 0:
+            running, n_seen = 0.0, 0
+        dl = DataLoader(ds, batch_size=cfg.batch_size, sampler=order[first * cfg.batch_size:].tolist(),
+                        collate_fn=collate, num_workers=cfg.num_workers,
+                        generator=torch.Generator().manual_seed(cfg.seed + epoch))  # keeps global RNG untouched
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        running, n_seen = 0.0, 0
-        bar = tqdm(dl, desc=f"epoch {epoch + 1}/{cfg.epochs}", leave=False)
-        for step, (ids, mask, labels, _) in enumerate(bar):
+        last_save = time.time()
+        bar = tqdm(dl, desc=f"epoch {epoch + 1}/{cfg.epochs}", initial=first, total=n_batches,
+                   leave=False)
+        for step, (ids, mask, labels, _) in enumerate(bar, start=first):
             with _autocast(device, cfg):
                 out = model(input_ids=ids.to(device), attention_mask=mask.to(device),
                             labels=labels.to(device))
                 loss = out.loss / grad_accum
             scaler.scale(loss).backward()
-            if (step + 1) % grad_accum == 0 or step + 1 == len(dl):
+            running += out.loss.item() * len(labels)
+            n_seen += len(labels)
+            if (step + 1) % grad_accum == 0 or step + 1 == n_batches:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
-            running += out.loss.item() * len(labels)
-            n_seen += len(labels)
+                if step + 1 < n_batches and time.time() - last_save > cfg.checkpoint_minutes * 60:
+                    save_last(epoch, step + 1)
+                    last_save = time.time()
             if step % 50 == 0:
-                bar.set_postfix(loss=f"{running / n_seen:.4f}")
+                bar.set_postfix(loss=f"{running / max(1, n_seen):.4f}")
 
+        train_loss = running / max(1, n_seen)
+        save_last(epoch, n_batches)  # training part of the epoch is safe before the long val pass
         va_proba = predict_docs(model, tokenizer, va_docs, cfg, device, desc="val")
         m = evaluate(va["label"], np.array(LABELS)[va_proba.argmax(1)])
-        history.append({"epoch": epoch + 1, "train_loss": running / n_seen,
+        history.append({"epoch": epoch + 1, "train_loss": train_loss,
                         "val_macro_f1": m["macro_f1"], "minutes": (time.time() - t0) / 60})
-        print(f"epoch {epoch + 1}: train loss {running / n_seen:.4f}, "
+        print(f"epoch {epoch + 1}: train loss {train_loss:.4f}, "
               f"val macro-F1 {m['macro_f1']:.4f} ({history[-1]['minutes']:.1f} min)")
         if m["macro_f1"] > best_f1:
             best_f1 = m["macro_f1"]
             torch.save({k: v.half() if v.is_floating_point() else v
                         for k, v in model.state_dict().items()}, run_dir / "best_model.pt")
             np.save(run_dir / "val_proba.npy", va_proba)
-        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
-                    "epoch": epoch + 1, "best_f1": best_f1, "history": history}, last_ckpt)
+        save_last(epoch + 1, 0)
 
     # --- best epoch -> final val metrics + test predictions ---
     state = torch.load(run_dir / "best_model.pt", map_location="cpu")
@@ -1087,7 +1130,6 @@ def train_encoder(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
                             cfg, device, desc="test")
     metrics = evaluate(va["label"], np.array(LABELS)[va_proba.argmax(1)])
     metrics["history"] = history
-    if last_ckpt.exists():
-        last_ckpt.unlink()  # 3x model size; not needed once training is finished
+    last_ckpt.unlink(missing_ok=True)  # not needed once training is finished
     return {"config": asdict(cfg), "metrics": metrics, "val_proba": va_proba,
             "test_proba": te_proba, "history": pd.DataFrame(history)}
