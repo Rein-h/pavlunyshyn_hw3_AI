@@ -1,7 +1,7 @@
 """
 UCU AI 2026 - Homework 3: human / ai / fusion text classification.
 
-All logic lives here; the notebook `hw3_text_detection.ipynb` only calls these
+All logic lives here; the notebook `hw3_text_detection_notebook.ipynb` only calls these
 functions. The same code runs on Google Colab and locally (VS Code):
 paths and device are detected automatically.
 
@@ -602,17 +602,97 @@ def compare_runs(paths: Paths, names: list[str], va: pd.DataFrame) -> pd.DataFra
 # =============================================================================
 # 5. Baseline: TF-IDF + linear models
 # =============================================================================
+BASELINE_FEATURES = {
+    "word": dict(analyzer="word", ngram_range=(1, 2), min_df=3, max_features=300_000,
+                 sublinear_tf=True),
+    "char": dict(analyzer="char_wb", ngram_range=(3, 5), min_df=5, max_features=300_000,
+                 sublinear_tf=True, lowercase=False),
+}
+
+DEFAULT_BASELINE_GRID = {
+    "features": ["word", "char", "word+char"],
+    "models": {"logreg": [1.0, 10.0], "linsvc": [0.1, 1.0]},
+}
+
+
+def split_fingerprint(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame | None = None) -> str:
+    """Short hash of the exact rows (and their order) of the split.
+
+    Cached features and saved models are reused only if the fingerprint matches,
+    so a changed split can never silently mix with old results.
+    """
+    import hashlib
+
+    h = hashlib.md5()
+    for df in (tr, va) + ((te,) if te is not None else ()):
+        h.update("\n".join(map(str, df["id"])).encode())
+        h.update(b"|")
+    return h.hexdigest()[:10]
+
+
 def make_vectorizer(kind: str):
     from sklearn.feature_extraction.text import TfidfVectorizer
 
-    if kind == "word":
-        return TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=3,
-                               max_features=300_000, sublinear_tf=True, dtype=np.float32)
-    if kind == "char":
-        return TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=5,
-                               max_features=300_000, sublinear_tf=True, lowercase=False,
-                               dtype=np.float32)
-    raise ValueError(kind)
+    return TfidfVectorizer(**BASELINE_FEATURES[kind], dtype=np.float32)
+
+
+def build_or_load_features(kind: str, tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
+                           cache_dir: Path | None, fingerprint: str, verbose: bool = True):
+    """TF-IDF of one kind for train / val / test. Fitted on the train split only.
+
+    With `cache_dir` the three matrices are saved once (`<kind>/*.npz`) and loaded on the
+    next call. `meta.json` is written last, so a half-written cache is never used.
+    """
+    import gc
+
+    from scipy.sparse import load_npz, save_npz
+
+    parts = ("train", "val", "test")
+    d = cache_dir / kind if cache_dir is not None else None
+    meta = {"fingerprint": fingerprint, "params": {k: str(v) for k, v in BASELINE_FEATURES[kind].items()}}
+    if d is not None and (d / "meta.json").exists():
+        if json.loads((d / "meta.json").read_text()) == meta:
+            t0 = time.time()
+            mats = tuple(load_npz(d / f"{p}.npz") for p in parts)
+            if verbose:
+                print(f"TF-IDF {kind}: loaded from cache, {mats[0].shape[1]:,} features "
+                      f"({time.time() - t0:.0f}s)")
+            return mats
+
+    t0 = time.time()
+    vec = make_vectorizer(kind)
+    mats = (vec.fit_transform(tr["text"]), vec.transform(va["text"]), vec.transform(te["text"]))
+    del vec
+    gc.collect()
+    if verbose:
+        print(f"TF-IDF {kind}: {mats[0].shape[1]:,} features ({time.time() - t0:.0f}s)")
+    if d is not None:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "meta.json").unlink(missing_ok=True)
+        for p, m in zip(parts, mats):
+            save_npz(d / f"{p}.npz", m, compressed=False)
+        (d / "meta.json").write_text(json.dumps(meta, indent=2))
+    return mats
+
+
+def load_feature_set(features: str, tr, va, te, cache_dir, fingerprint, verbose: bool = True):
+    """'word', 'char' or 'word+char' -> (X_train, X_val, X_test); combined part by part to save RAM."""
+    import gc
+
+    from scipy.sparse import hstack
+
+    kinds = features.split("+")
+    mats = [list(build_or_load_features(k, tr, va, te, cache_dir, fingerprint, verbose))
+            for k in kinds]
+    if len(mats) == 1:
+        return tuple(mats[0])
+    out = []
+    for i in range(3):
+        out.append(hstack([m[i] for m in mats], format="csr", dtype=np.float32))
+        for m in mats:
+            m[i] = None  # free each part as soon as it is combined
+        gc.collect()
+    return tuple(out)
 
 
 def make_linear_model(name: str, C: float, seed: int = SEED):
@@ -634,58 +714,96 @@ def model_scores(model, X) -> np.ndarray:
     return scores_to_proba(model.decision_function(X)[:, order])
 
 
-DEFAULT_BASELINE_GRID = {
-    "features": ["word", "char", "word+char"],
-    "models": {"logreg": [1.0, 10.0], "linsvc": [0.1, 1.0]},
-}
+def _model_id(features: str, model: str, C: float) -> str:
+    return f"{features}_{model}_C{C}"
 
 
-def run_baseline(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
-                 grid: dict | None = None, verbose: bool = True):
-    """Fit TF-IDF on the train split only, grid-search on the fixed val split.
+def _model_done(d: Path, fingerprint: str) -> bool:
+    f = d / "metrics.json"
+    if not (f.exists() and (d / "val_proba.npy").exists() and (d / "test_proba.npy").exists()):
+        return False
+    return json.loads(f.read_text()).get("fingerprint") == fingerprint
 
-    Returns (results table, best model info dict with val/test probabilities).
+
+def run_baseline_grid(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame, run_dir: Path,
+                      grid: dict | None = None, cache_features: bool = True,
+                      verbose: bool = True) -> pd.DataFrame:
+    """Grid search (feature set x model x C) on the fixed val split.
+
+    Every model is saved to `run_dir/grid/<features>_<model>_C<C>/` right after it is
+    fitted (metrics + val/test probabilities). Models already saved for the same split
+    are skipped, so after a crash the call simply continues. Only one feature set is
+    kept in memory at a time.
     """
-    from scipy.sparse import hstack
+    import gc
 
     grid = grid or DEFAULT_BASELINE_GRID
-    kinds = sorted({k for f in grid["features"] for k in f.split("+")})
-    X = {}
-    for kind in kinds:
-        t0 = time.time()
-        vec = make_vectorizer(kind)
-        X[kind] = (vec.fit_transform(tr["text"]), vec.transform(va["text"]), vec.transform(te["text"]))
-        if verbose:
-            print(f"TF-IDF {kind}: {X[kind][0].shape[1]:,} features ({time.time() - t0:.0f}s)")
+    fp = split_fingerprint(tr, va, te)
+    cache_dir = run_dir / "features" if cache_features else None
+    (run_dir / "grid").mkdir(parents=True, exist_ok=True)
 
-    def feats(fs, part):
-        mats = [X[k][part] for k in fs.split("+")]
-        return mats[0] if len(mats) == 1 else hstack(mats, format="csr")
-
-    results, best = [], None
     for fs in grid["features"]:
-        Xtr, Xva = feats(fs, 0), feats(fs, 1)
-        for model_name, Cs in grid["models"].items():
-            for C in Cs:
-                t0 = time.time()
-                model = make_linear_model(model_name, C).fit(Xtr, tr["label"])
-                proba = model_scores(model, Xva)
-                pred = np.array(LABELS)[proba.argmax(1)]
-                m = evaluate(va["label"], pred)
-                res = {"features": fs, "model": model_name, "C": C, "macro_f1": m["macro_f1"],
-                       **{f"F1 {l}": m[f"{l}_f1"] for l in LABELS},
-                       "fit_sec": round(time.time() - t0, 1)}
-                results.append(res)
-                if verbose:
-                    print(f"  {fs:10s} {model_name:7s} C={C:<5} macro-F1={m['macro_f1']:.4f}"
-                          f" ({res['fit_sec']}s)")
-                if best is None or m["macro_f1"] > best["metrics"]["macro_f1"]:
-                    best = {"config": {"features": fs, "model": model_name, "C": C},
-                            "metrics": m, "model": model, "val_proba": proba, "features": fs}
+        todo = [(m, C) for m, Cs in grid["models"].items() for C in Cs
+                if not _model_done(run_dir / "grid" / _model_id(fs, m, C), fp)]
+        if not todo:
+            if verbose:
+                print(f"{fs}: all models already saved, skipped")
+            continue
+        Xtr, Xva, Xte = load_feature_set(fs, tr, va, te, cache_dir, fp, verbose)
+        for model_name, C in todo:
+            t0 = time.time()
+            model = make_linear_model(model_name, C).fit(Xtr, tr["label"])
+            fit_sec = round(time.time() - t0, 1)
+            val_proba = model_scores(model, Xva)
+            test_proba = model_scores(model, Xte)
+            m = evaluate(va["label"], np.array(LABELS)[val_proba.argmax(1)])
+            d = run_dir / "grid" / _model_id(fs, model_name, C)
+            d.mkdir(parents=True, exist_ok=True)
+            np.save(d / "val_proba.npy", val_proba.astype(np.float32))
+            np.save(d / "test_proba.npy", test_proba.astype(np.float32))
+            info = {"features": fs, "model": model_name, "C": C, "fit_sec": fit_sec,
+                    "fingerprint": fp, **m}
+            (d / "metrics.json").write_text(json.dumps(info, indent=2))  # written last
+            if verbose:
+                print(f"  {fs:10s} {model_name:7s} C={C:<5} macro-F1={m['macro_f1']:.4f} ({fit_sec}s)")
+            del model, val_proba, test_proba
+            gc.collect()
+        del Xtr, Xva, Xte
+        gc.collect()
 
-    best["test_proba"] = model_scores(best["model"], feats(best["features"], 2))
-    table = pd.DataFrame(results).sort_values("macro_f1", ascending=False).reset_index(drop=True)
-    return table.round(4), best
+    table = collect_baseline_grid(run_dir, fp)
+    table.to_csv(run_dir / "grid.csv", index=False)
+    return table
+
+
+def collect_baseline_grid(run_dir: Path, fingerprint: str) -> pd.DataFrame:
+    """Table of all saved models of this split, best first."""
+    rows = []
+    for f in sorted((run_dir / "grid").glob("*/metrics.json")):
+        m = json.loads(f.read_text())
+        if m.get("fingerprint") != fingerprint:
+            continue
+        rows.append({"model_id": f.parent.name, "features": m["features"], "model": m["model"],
+                     "C": m["C"], "macro_f1": m["macro_f1"],
+                     **{f"F1 {l}": m[f"{l}_f1"] for l in LABELS}, "fit_sec": m["fit_sec"]})
+    return (pd.DataFrame(rows).sort_values("macro_f1", ascending=False)
+            .reset_index(drop=True).round(4))
+
+
+def finalize_baseline(run_dir: Path, va: pd.DataFrame, te: pd.DataFrame,
+                      sample: pd.DataFrame) -> dict:
+    """Copy the best grid model to `run_dir` as the baseline run (+ submission.csv)."""
+    table = pd.read_csv(run_dir / "grid.csv")
+    best_id = table.iloc[0]["model_id"]
+    d = run_dir / "grid" / best_id
+    m = json.loads((d / "metrics.json").read_text())
+    val_proba, test_proba = np.load(d / "val_proba.npy"), np.load(d / "test_proba.npy")
+    sub = make_submission(te["id"], np.array(LABELS)[test_proba.argmax(1)], sample)
+    config = {k: m[k] for k in ("features", "model", "C")} | {"model_id": best_id,
+                                                              "tfidf": BASELINE_FEATURES}
+    metrics = {k: v for k, v in m.items() if k not in ("features", "model", "C", "fit_sec")}
+    save_run(run_dir, metrics, config, va["id"], val_proba, te["id"], test_proba, sub)
+    return config
 
 
 # =============================================================================
