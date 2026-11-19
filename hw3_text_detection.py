@@ -1004,7 +1004,8 @@ def _load_model_and_tokenizer(cfg: EncoderConfig):
     model = AutoModelForSequenceClassification.from_pretrained(
         cfg.model_name, num_labels=len(LABELS),
         id2label=dict(enumerate(LABELS)), label2id=LABEL2ID)
-    return model, tokenizer
+    # some checkpoints (e.g. mDeBERTa) are stored in fp16; training needs fp32 master weights
+    return model.float(), tokenizer
 
 
 def train_encoder(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame,
